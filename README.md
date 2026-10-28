@@ -12,7 +12,9 @@ répartition de l'alimentation du bâtiment et tableau des flux.
    Le dossier `.streamlit` contient le thème ; il faut le conserver.
 3. Dans [Streamlit Community Cloud](https://share.streamlit.io/), créer une app
    à partir de ce dépôt et choisir **`app.py`** comme fichier principal.
-4. Sélectionner **Python 3.12** dans les paramètres avancés puis lancer le déploiement.
+4. Sélectionner **Python 3.12 ou 3.14** dans les paramètres avancés puis lancer le déploiement.
+   Les dépendances incluent pandas 2.3.3, compatible avec Python 3.14, afin d'éviter
+   la compilation de pandas 2.2.3 sur les nouveaux environnements Streamlit Cloud.
 
 L'application est prête à déployer ; aucun compte ni dépôt n'a été créé ou modifié
 pendant sa préparation.
@@ -38,6 +40,42 @@ python -m streamlit run app.py
 4. Les résultats se mettent à jour automatiquement. Les cycles équivalents sont
    calculés à partir des flux, et ne sont pas un réglage arbitraire.
 5. Ouvrir « Détail mensuel et export » pour télécharger les bilans CSV.
+6. Ouvrir « Rapport PDF », renseigner le client, le site et éventuellement une
+   référence d'étude, puis cliquer sur **Télécharger le rapport PDF**.
+   Le document est actualisé dès que les résultats ou les coordonnées changent.
+
+## Rapport PDF
+
+Le rapport reprend la maquette validée :
+
+- Page 1 : identité du client, période, scénario, bilan, taux avant/après batterie,
+  alimentation du bâtiment et conclusion.
+- Page 2 : flux d'énergie, paramètres de batterie, qualité des données et méthode.
+- Les avertissements de lecture et, si nécessaire, la liste complète des sources
+  sont ajoutés en annexe. Des coordonnées particulièrement longues peuvent
+  également allonger le document ; le contenu n'est pas coupé.
+
+Le rapport utilise les valeurs calculées par l'application. Il ne contient aucune
+valeur client codée en dur, aucun calcul financier et aucune recommandation de
+rentabilité. Les bilans estimatifs, les productions prévisionnelles, les données
+de démonstration et les batteries existantes sont signalés dans le PDF.
+
+`exemples/rapport_exemple.pdf` montre un rapport réellement généré sur les données
+synthétiques de l'exemple, avec une batterie de 30 kWh utiles et 10 kW.
+
+### Mettre à jour une application déjà installée
+
+Déposer ou remplacer les éléments suivants à la racine du dépôt GitHub :
+
+1. `app.py`
+2. `report.py`
+3. `requirements.txt` (avec pandas 2.3.3 et reportlab 4.4.9)
+4. Le dossier **`assets`**, avec ses deux polices et leur licence.
+
+Le dossier `assets/fonts` est indispensable : les polices sont embarquées dans le
+PDF pour conserver les accents et la présentation. La génération se fait en
+mémoire avec ReportLab, sans service externe, navigateur ni outil système à
+installer sur Streamlit Cloud. Les dépendances sont compatibles avec Python 3.14.
 
 « Voir un exemple » charge une année synthétique complète : production 12’000 kWh,
 import 5’000 kWh et export 7’000 kWh. Les taux initiaux sont 41,7 % et 50,0 %.
@@ -143,6 +181,7 @@ incomplets, les changements d'heure, les imports CSV/XLSX et le parcours Streaml
 - `simulation.py` : moteur de batterie existant, sans recharge réseau.
 - `energy_metrics.py` : bilans corrigés, contrôle mensuel et tableaux de résultats.
 - `demo.py` : année synthétique pour tester l'application.
+- `report.py`, `assets/fonts/` : génération du rapport PDF et polices intégrées.
 
 Les fichiers sont traités dans la mémoire et des dossiers temporaires du serveur.
 Le programme n'écrit pas les fichiers client dans le dépôt GitHub et ne les

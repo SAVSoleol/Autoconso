@@ -13,6 +13,7 @@ import streamlit as st
 from demo import make_demo
 from energy_metrics import MONTHS_FR, analyse, monthly_coverage
 from loaders import UnsupportedFormatError, load_meter_files, prepare_simulation_data
+from report import BatteryReport, ReportData, build_report, report_filename
 from ui import dashboard_html, fmt, header_html
 
 ROOT = Path(__file__).resolve().parent
@@ -48,6 +49,12 @@ def load_uploads(files, unit, position, minutes, blank_policy, same_meter):
 @st.cache_data(show_spinner=False)
 def demo_data():
     return make_demo()
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def report_pdf(data: ReportData):
+    """Cache sur les résultats et les coordonnées : aucun PDF périmé après une modification."""
+    return build_report(data)
 
 
 def _switch_source(source):
@@ -222,6 +229,37 @@ def main():
     st.html(dashboard_html(base, after, sim, existing=existing, estimated=estimated_period))
     if sim:
         cycles_placeholder.caption(f"Cycles équivalents sur la période : {fmt(sim.cycles_period,1)}")
+
+    with st.expander("Rapport PDF"):
+        st.caption("Rapport de deux pages conforme à la maquette. Les avertissements de lecture sont ajoutés en annexe lorsqu'ils sont présents.")
+        identity_columns = st.columns(2)
+        client_name = identity_columns[0].text_input("Client / nom du projet", key="report_client", max_chars=160,
+                                                    placeholder="Nom du client ou de l'installation")
+        report_reference = identity_columns[1].text_input("Référence de l'étude", key="report_reference", max_chars=80,
+                                                         placeholder="Facultatif")
+        site_address = st.text_input("Adresse / site", key="report_address", max_chars=240, placeholder="Facultatif")
+        report_data = ReportData(
+            base=base, after=after, period_start=meta.start, period_end=meta.end,
+            client_name=client_name or ("Exemple de démonstration" if is_demo else ""),
+            site_address=site_address, reference=report_reference,
+            source_files=(meta.source,) if is_demo else tuple(file.name for file in uploads),
+            battery=BatteryReport.from_simulation(sim) if sim else None,
+            valid_intervals=int(valid.sum()), expected_intervals=len(frame),
+            dt_minutes=meta.dt_hours * 60, completeness=meta.completeness,
+            monthly_entered_kwh=sum(monthly_pv.values()),
+            production_estimated=production_kind.startswith("Estimée"),
+            prorata=estimated_period, existing_battery=existing, is_demo=is_demo,
+            warnings=tuple(meta.warnings),
+        )
+        try:
+            pdf_content = report_pdf(report_data)
+        except (OSError, ValueError) as error:
+            st.error(f"Le rapport PDF ne peut pas être généré : {error}")
+        else:
+            st.download_button("Télécharger le rapport PDF", data=pdf_content,
+                               file_name=report_filename(report_data), mime="application/pdf",
+                               key="download_report", width="stretch", type="primary")
+        st.caption("Le document reprend les résultats et paramètres actuels. Après une modification, le rapport est automatiquement actualisé.")
 
     with st.expander("Détail mensuel et export"):
         if existing:

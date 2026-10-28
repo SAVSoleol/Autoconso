@@ -1,2 +1,4 @@
 -r requirements.txt
 pytest>=8,<10
+pypdf>=6,<7
+pdfplumber>=0.11,<1

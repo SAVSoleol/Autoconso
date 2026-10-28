@@ -27,7 +27,7 @@ def test_demo_and_battery_toggle():
     at = demo_app()
     assert '41,7 %' in get_dashboard(at)
     assert 'Pertes de conversion' in get_dashboard(at)
-    assert len(at.get("download_button")) == 2
+    assert len(at.get("download_button")) == 3
     at.checkbox(key="simulate_battery").uncheck().run()
     assert not at.exception
     assert 'Pertes de conversion' not in get_dashboard(at)
@@ -63,3 +63,18 @@ def test_switching_back_to_own_data_clears_demo():
     next(b for b in at.button if b.label == "Mes données").click().run()
     assert not at.exception
     assert '— %' in get_dashboard(at)
+
+
+def test_pdf_download_updates_with_client_and_battery_settings():
+    at = demo_app()
+    def pdf_url():
+        return next(b.proto.url for b in at.get("download_button")
+                    if b.proto.label == "Télécharger le rapport PDF")
+    original = pdf_url()
+    at.text_input(key="report_client").set_value("École de Genève & Fils").run()
+    assert not at.exception
+    with_client = pdf_url()
+    assert with_client != original
+    at.slider(key="capacity").set_value(30).run()
+    assert not at.exception
+    assert pdf_url() != with_client
