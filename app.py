@@ -1,195 +1,251 @@
-"""Calculateur simple d'autoconsommation et d'autonomie PV.
-
-Lancement : python -m streamlit run app.py
-"""
+"""SOLEOL · Autoconsommation et autonomie. Lancer : streamlit run app.py"""
 from __future__ import annotations
 
-from dataclasses import replace
+from html import escape
 from pathlib import Path
-from zipfile import ZipFile
+from zipfile import BadZipFile, ZipFile
 import tempfile
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 
+from demo import make_demo
+from energy_metrics import MONTHS_FR, analyse, monthly_coverage
 from loaders import UnsupportedFormatError, load_meter_files, prepare_simulation_data
-from simulation import simulate
-from energy_metrics import MONTHS_FR, calculate_metrics, production_for_measurements
+from ui import dashboard_html, fmt, header_html
+
+ROOT = Path(__file__).resolve().parent
 
 
-CSS = """
-<style>
-.block-container {max-width: 1300px; padding-top: 2rem; padding-bottom: 3rem;}
-.metric-card {background:#101827;border:1px solid rgba(148,163,184,.25);border-radius:16px;padding:18px 20px;min-height:132px;}
-.metric-label {color:#cbd5e1;font-size:.88rem;font-weight:700;margin-bottom:12px;}
-.metric-value {font-size:2rem;font-weight:800;line-height:1;color:#f8fafc;}.orange{color:#fb923c}.green{color:#4ade80}.blue{color:#60a5fa}.purple{color:#c084fc}
-.metric-sub {color:#94a3b8;font-size:.78rem;margin-top:10px;}
-.metric-grid {display:grid;grid-template-columns:repeat(4,minmax(180px,1fr));gap:12px;margin:14px 0 22px;}
-.notice {border-left:4px solid #fb923c;background:rgba(251,146,60,.10);padding:12px 15px;border-radius:0 10px 10px 0;color:#e2e8f0;margin:8px 0 18px;}
-@media(max-width:900px){.metric-grid{grid-template-columns:repeat(2,minmax(150px,1fr));}}
-</style>
-"""
-
-
-@st.cache_data(show_spinner=False, max_entries=8)
-def _load_file(name: str, content: bytes, unit: str):
-    """Charge un fichier sans utiliser le nom fourni comme chemin."""
-    if len(content) > 30 * 1024**2:
-        raise UnsupportedFormatError("Le fichier dépasse 30 Mo.")
-    suffix = Path(name).suffix.lower()
+@st.cache_data(show_spinner=False, max_entries=6)
+def load_uploads(files, unit, position, minutes, blank_policy, same_meter):
+    """Les noms fournis ne sont jamais utilisés comme chemins sur le serveur."""
+    if sum(len(content) for _, content in files) > 120 * 1024**2:
+        raise UnsupportedFormatError("Le total des fichiers dépasse 120 Mo.")
     with tempfile.TemporaryDirectory() as folder:
-        path = Path(folder) / f"mesures{suffix}"
-        path.write_bytes(content)
-        if suffix == ".xlsx":
-            with ZipFile(path) as archive:
-                if sum(item.file_size for item in archive.infolist()) > 250 * 1024**2:
-                    raise UnsupportedFormatError("Le classeur est trop volumineux après décompression.")
-        raw, meta = load_meter_files([path], unit, timestamp_position="end", ambiguous_policy="auto",
-                                     interval_minutes=None, same_meter=False, aggregate_devices=False,
-                                     blank_policy="auto")
-    return raw, meta
+        paths = []
+        for index, (name, content) in enumerate(files):
+            suffix = Path(name).suffix.lower()
+            if suffix not in {".csv", ".xls", ".xlsx"}:
+                raise UnsupportedFormatError("Formats acceptés : CSV, XLS et XLSX.")
+            if len(content) > 30 * 1024**2:
+                raise UnsupportedFormatError("Un fichier dépasse 30 Mo.")
+            path = Path(folder) / f"courbe_{index}{suffix}"
+            path.write_bytes(content)
+            if suffix == ".xlsx":
+                with ZipFile(path) as archive:
+                    if sum(item.file_size for item in archive.infolist()) > 250 * 1024**2:
+                        raise UnsupportedFormatError("Classeur trop volumineux après décompression.")
+            paths.append(path)
+        frame, meta = load_meter_files(paths, data_unit=unit, timestamp_position=position,
+                                       interval_minutes=minutes, same_meter=same_meter,
+                                       blank_policy=blank_policy)
+    meta.source = " · ".join(name for name, _ in files)
+    return frame, meta
 
 
-def _fmt(value: float, decimals: int = 0) -> str:
-    return f"{float(value):,.{decimals}f}".replace(",", " ")
+@st.cache_data(show_spinner=False)
+def demo_data():
+    return make_demo()
 
 
-def _metrics_html(metrics, title: str, battery_note: str = "") -> str:
-    return f"""
-    <h3 style="margin-top:1.5rem">{title}</h3>
-    <div class="metric-grid">
-      <div class="metric-card"><div class="metric-label">Production solaire</div><div class="metric-value orange">{_fmt(metrics.production_kwh)} kWh</div><div class="metric-sub">Production AC sur la période analysée</div></div>
-      <div class="metric-card"><div class="metric-label">Électricité vendue</div><div class="metric-value orange">{_fmt(metrics.export_kwh)} kWh</div><div class="metric-sub">Injection réseau {battery_note}</div></div>
-      <div class="metric-card"><div class="metric-label">Taux d'autoconsommation</div><div class="metric-value green">{metrics.self_consumption_pct:.1f} %</div><div class="metric-sub">{_fmt(metrics.solar_used_kwh)} kWh de solaire utilisés sur site</div></div>
-      <div class="metric-card"><div class="metric-label">Autonomie énergétique</div><div class="metric-value blue">{metrics.self_sufficiency_pct:.1f} %</div><div class="metric-sub">{_fmt(metrics.solar_used_kwh)} kWh solaire / {_fmt(metrics.consumption_kwh)} kWh consommés</div></div>
-    </div>
-    """
+def _switch_source(source):
+    st.session_state["source"] = source
+    st.session_state.pop("pv_source", None)
+    for key in list(st.session_state):
+        if key.startswith("pv_"):
+            del st.session_state[key]
 
 
-def _monthly_results(frame: pd.DataFrame, valid: np.ndarray, dt_hours: float,
-                     monthly_pv: dict[int, float], imp: np.ndarray, exp: np.ndarray) -> pd.DataFrame:
-    local = pd.DatetimeIndex(frame.timestamp).tz_convert("Europe/Zurich")
-    periods = pd.PeriodIndex(local.tz_localize(None), freq="M")
-    records = []
-    for period in periods.unique():
-        mask = (periods == period) & valid
-        if not mask.any():
-            continue
-        start = pd.Timestamp(period.start_time, tz="Europe/Zurich")
-        end = start + pd.offsets.MonthBegin(1)
-        total_hours = (end.tz_convert("UTC") - start.tz_convert("UTC")).total_seconds() / 3600
-        pv = monthly_pv[period.month] * min(1.0, mask.sum() * dt_hours / total_hours)
-        metric = calculate_metrics(pv, np.nansum(imp[mask]), np.nansum(exp[mask]))
-        records.append({"Mois": period.strftime("%m.%Y"), "Production PV (kWh)": metric.production_kwh,
-                        "Import réseau (kWh)": metric.import_kwh, "Injection (kWh)": metric.export_kwh,
-                        "Autoconsommation (%)": metric.self_consumption_pct,
-                        "Autonomie (%)": metric.self_sufficiency_pct})
-    return pd.DataFrame(records)
+def _upload_changed():
+    _switch_source("upload")
 
 
-def main() -> None:
-    st.set_page_config(page_title="Autoconsommation & autonomie PV", page_icon="☀️", layout="wide")
-    st.markdown(CSS, unsafe_allow_html=True)
-    st.title("☀️ Autoconsommation & autonomie PV")
-    st.caption("Analyse basée sur les flux réseau import/export et la production photovoltaïque mensuelle.")
+def _reset_battery():
+    for key, value in {"capacity": 15, "power": 5., "efficiency": 92,
+                       "simulate_battery": True}.items():
+        st.session_state[key] = value
+
+
+def _section(number, title):
+    st.html(f'<div class="pv-section"><span class="pv-number">{number}</span>{title}</div>')
+
+
+def _empty_dashboard():
+    cards = ''.join(f'<article><p>{label}</p><div><strong>—</strong><small>kWh</small></div></article>'
+                    for label in ["Production photovoltaïque", "Consommation du bâtiment", "Solaire utilisé directement"])
+    rates = ''.join(f'<section class="pv-result"><h2>{label}</h2><p class="pv-subtitle">{description}</p><div class="pv-comparison"><span class="pv-after">— %</span></div><div class="pv-track"></div></section>'
+                    for label, description in [("Autoconsommation", "Part de votre production solaire conservée sur site."),
+                                                ("Autonomie énergétique", "Part de votre consommation couverte par le solaire.")])
+    st.html(f'<div class="pv-dashboard"><div class="pv-summary">{cards}</div><div class="pv-cards">{rates}</div></div>')
+
+
+def main():
+    st.set_page_config(page_title="SOLEOL · Simulateur solaire", page_icon="☀️", layout="wide", initial_sidebar_state="expanded")
+    st.html(f"<style>{(ROOT / 'styles.css').read_text(encoding='utf-8')}</style>")
+    st.session_state.setdefault("source", "upload")
+    raw = raw_meta = frame = meta = None
+    load_error = None
+    demo_pv = None
 
     with st.sidebar:
-        st.header("Données de mesure")
-        unit = st.selectbox("Unité de la courbe", ["Automatique", "kWh", "kW", "Wh", "W"])
-        st.caption("kW/W sont convertis automatiquement en kWh au pas de mesure détecté.")
-        st.header("Batterie")
-        battery_case = st.radio(
-            "Situation de la courbe",
-            ["Aucune batterie", "Batterie existante déjà incluse dans la courbe", "Batterie à simuler sur une courbe sans batterie"],
-            help="Une courbe mesurée avec une batterie en service contient déjà son effet : ne pas la simuler une seconde fois."
-        )
-        capacity = 0.0
-        power = 0.0
-        efficiency = .90
-        soc_min = 5
-        if battery_case != "Aucune batterie":
-            capacity = st.number_input("Capacité batterie (kWh)", min_value=.1, max_value=5_000., value=10., step=1.)
-        if battery_case.startswith("Batterie à simuler"):
-            power = st.number_input("Puissance charge/décharge (kW)", min_value=.1, max_value=2_500., value=5., step=.5)
-            efficiency = st.slider("Rendement aller-retour", .50, 1.00, .90, .01)
-            soc_min = st.slider("SOC minimum (%)", 0, 95, 5)
+        st.html('<div class="pv-brand"><strong>SOLEOL</strong><span>/ Simulateur solaire</span></div>')
+        _section(1, "Installation existante")
+        uploads = st.file_uploader("Courbes import / export réseau", type=["csv", "xlsx", "xls"],
+                                   accept_multiple_files=True, key="meter_uploads", on_change=_upload_changed,
+                                   help="Export bidirectionnel du compteur, avec date, import et export. Plusieurs fichiers : même compteur et périodes sans chevauchement.")
+        st.button("Voir un exemple", on_click=_switch_source, args=("demo",), width="stretch")
+        if st.session_state.source == "demo":
+            st.button("Mes données", on_click=_switch_source, args=("upload",), width="stretch")
+        summary_placeholder = st.empty()
 
-    uploaded = st.file_uploader("Courbe de charge import/export", type=["xlsx", "xls", "csv"])
-    if uploaded is None:
-        st.info("Dépose ici la courbe de charge du compteur. Ensuite, renseigne les 12 productions PV mensuelles.")
-        return
-    try:
-        with st.spinner("Lecture de la courbe import/export…"):
-            raw, raw_meta = _load_file(uploaded.name, uploaded.getvalue(), "auto" if unit == "Automatique" else unit)
-            frame, meta = prepare_simulation_data(raw, raw_meta, policy="segments")
-    except (ValueError, OSError, KeyError, UnsupportedFormatError) as error:
-        st.error(str(error))
-        return
+        with st.expander("Réglages des courbes"):
+            unit = st.selectbox("Unité des valeurs", ["Automatique", "kWh", "kW", "Wh", "W"], key="unit")
+            timestamp = st.selectbox("Horodatage", ["Fin d'intervalle", "Début d'intervalle"], key="timestamp",
+                                     help="Pour une valeur à 00:15 couvrant 00:00–00:15, choisir fin d'intervalle.")
+            interval = st.selectbox("Pas de mesure (minutes)", ["Automatique", 5, 10, 15, 30, 60], key="interval")
+            segments = st.checkbox("Analyser les segments mesurés malgré les trous", value=False, key="segments",
+                                   help="Les valeurs manquantes restent inconnues. La batterie redémarre vide après chaque trou.")
+            prorata = st.checkbox("Estimer la production des mois incomplets au prorata", value=False, key="prorata",
+                                  help="À activer uniquement si un bilan estimatif est acceptable. Le temps mesuré ne représente pas nécessairement le même pourcentage de production solaire.")
+            blank_unknown = st.checkbox("Groupe E : cellules vides toujours inconnues", key="blank_unknown",
+                                        help="Par défaut, la convention zéro d'un flux vide est appliquée uniquement au modèle Groupe E reconnu, si l'autre flux est renseigné.")
+            existing = st.checkbox("Batterie déjà en service dans les courbes", key="existing",
+                                   help="Aucune seconde batterie n'est simulée. Les taux affichés sont des bilans apparents ; les pertes et variations de stock ne sont pas isolées.")
+            same_meter = False
+            if len(uploads) > 1:
+                same_meter = st.checkbox("Ces fichiers concernent le même compteur", key="same_meter")
 
-    st.caption(f"Fichier : {uploaded.name} · {meta.coverage_days:.0f} jours · pas {meta.dt_hours * 60:g} min · données exploitables {meta.completeness:.1%}")
-    st.markdown("### Production photovoltaïque mensuelle")
-    st.markdown("<div class='notice'>Saisir la production <b>AC</b> à la sortie des onduleurs (production mesurée ou E_Grid PVsyst). Les valeurs sont celles d'une année-type ; le programme les pondère automatiquement si le premier ou le dernier mois est incomplet.</div>", unsafe_allow_html=True)
-    columns = st.columns(3)
-    monthly_pv = {}
-    for month, label in enumerate(MONTHS_FR, start=1):
-        with columns[(month - 1) % 3]:
-            monthly_pv[month] = st.number_input(f"{label} (kWh)", min_value=0.0, max_value=2_000_000.0,
-                                                value=0.0, step=100.0, key=f"pv_{month}")
-    if sum(monthly_pv.values()) <= 0:
-        st.info("Renseigne les productions solaires mensuelles pour obtenir les taux.")
+        try:
+            if st.session_state.source == "demo":
+                frame, meta, demo_pv = demo_data()
+                # La démo est déjà normalisée et complète, indépendamment des réglages du fichier.
+            elif uploads:
+                if len(uploads) > 1 and not same_meter:
+                    raise UnsupportedFormatError("Confirmer que les fichiers concernent le même compteur dans les réglages des courbes.")
+                raw, raw_meta = load_uploads(tuple((file.name, file.getvalue()) for file in uploads),
+                                             "auto" if unit == "Automatique" else unit,
+                                             "end" if timestamp == "Fin d'intervalle" else "start",
+                                             None if interval == "Automatique" else interval,
+                                             "unknown" if blank_unknown else "auto", same_meter)
+                frame, meta = prepare_simulation_data(raw, raw_meta, policy="segments" if segments else "block")
+        except (ValueError, OSError, KeyError, BadZipFile, ImportError) as error:
+            load_error = str(error)
+
+        st.divider()
+        _section(2, "Production photovoltaïque")
+        production_kind = st.selectbox("Origine de la production", ["Mesurée aux onduleurs", "Estimée (PVsyst / autre)"], key="production_kind")
+        monthly_pv = {}
+        if frame is not None and meta is not None:
+            coverage = monthly_coverage(frame.timestamp, frame.simulation_valid, meta.dt_hours)
+            active = set(coverage.loc[coverage.hours > 0, "period"])
+            identity = "demo-2025" if demo_pv else meta.fingerprint
+            if st.session_state.get("pv_source") != identity:
+                for period in active:
+                    st.session_state[f"pv_{period}"] = demo_pv.get(period) if demo_pv else None
+                st.session_state.pv_source = identity
+            for year in sorted({int(period[:4]) for period in active}):
+                with st.expander(f"Production mensuelle · {year}", expanded=not all(st.session_state.get(f"pv_{p}") is not None for p in active)):
+                    st.caption("Production totale AC de chaque mois, à la sortie des onduleurs. Saisir 0 pour un mois sans production.")
+                    cols = st.columns(2)
+                    for month, label in enumerate(MONTHS_FR, 1):
+                        period = f"{year}-{month:02d}"
+                        with cols[(month - 1) % 2]:
+                            value = st.number_input(label + " (kWh)", min_value=0., max_value=20_000_000., value=None,
+                                                    step=10., placeholder="À saisir", key=f"pv_{period}", disabled=period not in active)
+                        if period in active:
+                            monthly_pv[period] = value
+            available_pv = sum(v for v in monthly_pv.values() if v is not None)
+            st.caption(f"Production saisie : {fmt(available_pv)} kWh")
+        else:
+            st.caption("Importez la courbe pour renseigner les 12 mois de l'année concernée.")
+
+        st.divider()
+        _section(3, "Ajouter une batterie")
+        simulate_enabled = st.checkbox("Simuler une batterie", value=True, key="simulate_battery", disabled=existing)
+        battery_disabled = existing or not simulate_enabled
+        capacity = st.slider("Capacité utile (kWh)", min_value=1, max_value=200, value=15, step=1, key="capacity", disabled=battery_disabled,
+                             help="Énergie utilisable entre le SOC minimum et maximum. Le modèle ne retranche pas une seconde réserve.")
+        power = st.number_input("Puissance charge / décharge (kW)", min_value=.1, max_value=2500., value=5., step=.5, key="power", disabled=battery_disabled)
+        efficiency = st.slider("Rendement aller-retour (%)", min_value=50, max_value=100, value=92, step=1, key="efficiency", disabled=battery_disabled)
+        st.button("Réinitialiser la batterie", on_click=_reset_battery, width="stretch")
+        cycles_placeholder = st.empty()
+        st.caption("Les cycles sont calculés à partir des courbes. Aucun nombre de cycles n'est imposé.")
+
+    is_demo = st.session_state.source == "demo"
+    scenario = f"Batterie {capacity} kWh · {fmt(power,1)} kW" if simulate_enabled and not existing else "Batterie existante" if existing else "Sans batterie"
+    period_label = ""
+    if meta:
+        start = pd.Timestamp(meta.start)
+        last = pd.Timestamp(meta.end) - pd.Timedelta(minutes=1)
+        period_label = f"{start:%d.%m.%Y} au {last:%d.%m.%Y}"
+    st.html(header_html(period_label, "Exemple synthétique · 2025" if is_demo else "Courbes du compteur", scenario))
+    if load_error:
+        st.error(load_error)
+        _empty_dashboard()
+        return
+    if frame is None or meta is None:
+        st.info("Importez vos courbes de charge dans la barre latérale, puis renseignez la production solaire mois par mois. « Voir un exemple » permet de tester l'interface.")
+        _empty_dashboard()
         return
 
     valid = frame.simulation_valid.to_numpy(bool)
-    imp_before = frame.import_kWh.to_numpy(float)
-    exp_before = frame.export_kWh.to_numpy(float)
+    imported = float(frame.loc[valid, "import_kWh"].sum())
+    exported = float(frame.loc[valid, "export_kWh"].sum())
+    summary_placeholder.html(f'<div class="pv-readonly"><div><span>Import réseau mesuré</span><strong>{fmt(imported)} kWh</strong></div><div><span>Export réseau mesuré</span><strong>{fmt(exported)} kWh</strong></div></div>')
+    st.caption(f"{meta.dt_hours * 60:g} min par mesure · {int(valid.sum()):,} intervalles exploités · {meta.completeness:.1%} des intervalles présents et valides · {escape(meta.source)}")
+
+    if any(value is None for value in monthly_pv.values()):
+        missing = [f"{MONTHS_FR[int(period[-2:])-1]} {period[:4]}" for period, value in monthly_pv.items() if value is None]
+        st.info("Production mensuelle à compléter : " + ", ".join(missing) + ".")
+        _empty_dashboard()
+        return
     try:
-        pv_production = production_for_measurements(frame.timestamp, valid, meta.dt_hours, monthly_pv)
-        base = calculate_metrics(pv_production, np.nansum(imp_before[valid]), np.nansum(exp_before[valid]))
+        with st.spinner("Calcul du bilan et de la simulation…"):
+            base, after, sim, monthly, coverage = analyse(
+                frame, meta, monthly_pv, capacity=capacity, power=power,
+                efficiency=efficiency / 100, simulate_battery=simulate_enabled and not existing,
+                allow_prorata=prorata)
     except ValueError as error:
         st.error(str(error))
+        _empty_dashboard()
         return
 
-    if battery_case.startswith("Batterie à simuler"):
-        try:
-            simulation = simulate(
-                imp_before, exp_before, capacity, power, dt_hours=meta.dt_hours, roundtrip_eff=efficiency,
-                tariff_import=0., tariff_export=0., coverage_days=meta.coverage_days, soc_min_pct=float(soc_min),
-                timestamps=frame.timestamp, valid_mask=valid, reset_before=frame.reset_before.to_numpy(bool),
-                dispatch_order="discharge_first",
-            )
-            after = calculate_metrics(pv_production, simulation.import_after_total, simulation.export_after_total)
-        except ValueError as error:
-            st.error(f"Simulation batterie impossible : {error}")
-            return
-        st.markdown(_metrics_html(base, "Sans batterie"), unsafe_allow_html=True)
-        st.markdown(_metrics_html(after, f"Avec batterie simulée : {capacity:g} kWh / {power:g} kW", "après batterie"), unsafe_allow_html=True)
-        delta_auto = after.self_consumption_pct - base.self_consumption_pct
-        delta_autonomy = after.self_sufficiency_pct - base.self_sufficiency_pct
-        st.success(f"Gain estimé avec la batterie : +{delta_auto:.1f} points d'autoconsommation et +{delta_autonomy:.1f} points d'autonomie énergétique.")
-        imp_display, exp_display = simulation.import_after, simulation.export_after
-    else:
-        title = "Situation mesurée sans batterie" if battery_case == "Aucune batterie" else f"Situation mesurée avec batterie existante : {capacity:g} kWh"
-        st.markdown(_metrics_html(base, title), unsafe_allow_html=True)
-        if battery_case != "Aucune batterie":
-            st.info("La capacité est indiquée à titre de contexte. Comme la courbe contient déjà le fonctionnement réel de cette batterie, le calcul ne la simule pas une seconde fois.")
-        imp_display, exp_display = imp_before, exp_before
+    estimated_period = bool(((coverage.fraction < 1 - 1e-8) & (coverage.hours > 0)).any())
+    if estimated_period:
+        st.warning("Bilan estimatif : la production des mois incomplets est répartie au prorata du temps mesuré. Les heures manquantes ne sont pas reconstituées.")
+    if production_kind.startswith("Estimée") and not is_demo:
+        st.warning("La production PV est prévisionnelle : les taux calculés sont des estimations, même si les flux réseau sont mesurés.")
+    if existing:
+        st.warning("Batterie existante : aucune seconde simulation. Les résultats sont des bilans apparents incluant pertes et variation de stock. Une charge réseau éventuelle ne peut pas être distinguée.")
+    st.html(dashboard_html(base, after, sim, existing=existing, estimated=estimated_period))
+    if sim:
+        cycles_placeholder.caption(f"Cycles équivalents sur la période : {fmt(sim.cycles_period,1)}")
 
-    try:
-        monthly = _monthly_results(frame, valid, meta.dt_hours, monthly_pv, imp_display, exp_display)
-    except ValueError as error:
-        st.warning(f"Le détail mensuel ne peut pas être calculé : {error}")
-        return
-    st.markdown("### Détail mensuel")
-    st.dataframe(monthly.round(1), hide_index=True, width="stretch")
-    fig = go.Figure()
-    fig.add_bar(x=monthly["Mois"], y=monthly["Production PV (kWh)"], name="Production PV", marker_color="#f59e0b")
-    fig.add_bar(x=monthly["Mois"], y=monthly["Injection (kWh)"], name="Injection réseau", marker_color="#fb7185")
-    fig.add_bar(x=monthly["Mois"], y=monthly["Import réseau (kWh)"], name="Import réseau", marker_color="#60a5fa")
-    fig.update_layout(barmode="group", height=400, yaxis_title="kWh / mois", legend=dict(orientation="h", y=1.12))
-    st.plotly_chart(fig, width="stretch", config={"displaylogo": False})
-    st.caption("Autoconsommation = (production PV − injection réseau) / production PV. Autonomie énergétique = solaire utilisé sur site / (solaire utilisé sur site + import réseau). Les taux d'une batterie existante sont déduits du bilan compteur ; un journal charge/décharge batterie serait nécessaire pour isoler précisément ses pertes.")
+    with st.expander("Détail mensuel et export"):
+        if existing:
+            st.caption("Les colonnes « avant / après » sont identiques : situation mesurée avec la batterie existante. Les taux sont apparents.")
+        st.dataframe(monthly.round(2), hide_index=True, width="stretch")
+        columns = st.columns(2)
+        columns[0].download_button("Télécharger le détail mensuel", data=monthly.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
+                                   file_name="soleol_bilan_mensuel.csv", mime="text/csv", width="stretch")
+        summary = pd.DataFrame({"Indicateur": ["Production PV (kWh)", "Consommation bâtiment (kWh)", "Import réseau (kWh)", "Export réseau (kWh)", "Autoconsommation (%)", "Autonomie (%)"],
+                                "Avant": [base.production_kwh, base.consumption_kwh, base.import_kwh, base.export_kwh, base.self_consumption_pct, base.self_sufficiency_pct],
+                                "Après": [after.production_kwh, after.consumption_kwh, after.import_kwh, after.export_kwh, after.self_consumption_pct, after.self_sufficiency_pct]})
+        summary["Période"] = period_label
+        summary["Nature du bilan"] = "Apparent (batterie existante)" if existing else "Exemple synthétique" if is_demo else "Estimatif" if estimated_period or production_kind.startswith("Estimée") else "Production et réseau mesurés ; batterie simulée" if sim else "Production et réseau mesurés"
+        columns[1].download_button("Télécharger la synthèse", data=summary.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
+                                   file_name="soleol_synthese.csv", mime="text/csv", width="stretch")
+        st.caption("Les valeurs concernent uniquement la période indiquée. Aucune extrapolation automatique à l'année.")
+
+    with st.expander("Qualité des données et hypothèses"):
+        st.write(f"Période : {period_label} · Fuseau : Europe/Zurich · Pas : {meta.dt_hours * 60:g} min.")
+        st.write(f"Couverture du fichier : {meta.coverage_days:.1f} jours. Intervalles valides : {meta.completeness:.1%}.")
+        for warning in meta.warnings:
+            st.warning(warning)
+        st.dataframe(coverage.rename(columns={"label": "Mois", "hours": "Heures exploitées", "month_hours": "Heures du mois", "fraction": "Part du mois"})[["Mois", "Heures exploitées", "Heures du mois", "Part du mois"]], hide_index=True)
+        st.caption("Si un intervalle contient à la fois import et export, la décharge précède la charge. Leur ordre réel n'est pas connu à l'intérieur du pas de mesure. Ni vieillissement, ni auxiliaires, ni recharge réseau ne sont simulés.")
 
 
 if __name__ == "__main__":
