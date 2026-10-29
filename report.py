@@ -307,9 +307,9 @@ class _MonthlyHistogram(Flowable):
 
     def draw(self):
         c = self.canv
-        series = [("Production solaire", "production_kwh", ORANGE),
-                  ("Soutirage réseau", "import_kwh", INK),
-                  ("Export réseau", "export_kwh", colors.HexColor("#aab8c4"))]
+        series = [("Production solaire", "production_kwh", colors.HexColor("#2e9f57")),
+                  ("Soutirage réseau", "import_kwh", BLUE),
+                  ("Export réseau", "export_kwh", colors.HexColor("#e7b91b"))]
         for i, (label, _, color) in enumerate(series):
             x = i*WIDTH/3
             c.setFillColor(color)
