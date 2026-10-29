@@ -247,9 +247,7 @@ def main():
         cycles_placeholder.caption(f"Cycles équivalents sur la période : {fmt(sim.cycles_period,1)}")
 
     with st.expander("Rapport PDF"):
-        st.caption("Bilan d'autoconsommation et d'autonomie, histogramme annuel et tableau des 12 mois. La période réelle du fichier est conservée.")
-        include_battery = st.checkbox("Inclure aussi la comparaison avec la batterie simulée", value=False,
-                                      disabled=sim is None, key="report_include_battery") and sim is not None
+        st.caption("Deux pages pour le bilan mesuré, l'histogramme annuel et le tableau des 12 mois. Si « Simuler une batterie » est coché, une troisième page présente automatiquement la simulation.")
         identity_columns = st.columns(2)
         client_name = identity_columns[0].text_input("Client / nom du projet", key="report_client", max_chars=160,
                                                     placeholder="Nom du client ou de l'installation")
@@ -257,11 +255,11 @@ def main():
                                                          placeholder="Facultatif")
         site_address = st.text_input("Adresse / site", key="report_address", max_chars=240, placeholder="Facultatif")
         report_data = ReportData(
-            base=base, after=after if include_battery else base, period_start=meta.start, period_end=meta.end,
+            base=base, after=after, period_start=meta.start, period_end=meta.end,
             client_name=client_name or ("Exemple de démonstration" if is_demo else ""),
             site_address=site_address, reference=report_reference,
             source_files=(meta.source,) if is_demo else tuple(file.name for file in uploads),
-            battery=BatteryReport.from_simulation(sim) if include_battery else None,
+            battery=BatteryReport.from_simulation(sim) if sim is not None else None,
             valid_intervals=int(valid.sum()), expected_intervals=len(frame),
             dt_minutes=meta.dt_hours * 60, completeness=meta.completeness,
             monthly_entered_kwh=sum(monthly_pv.values()),

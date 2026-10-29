@@ -5,7 +5,7 @@ valeur de la maquette n'est codée en dur. Aucun navigateur ni réseau requis.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from io import BytesIO
 from math import isfinite, ceil
@@ -26,7 +26,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 from reportlab.platypus import (
     BaseDocTemplate, Flowable, Frame, KeepTogether, PageBreak,
-    PageTemplate, Paragraph, Spacer, Table, TableStyle,
+    NextPageTemplate, PageTemplate, Paragraph, Spacer, Table, TableStyle,
 )
 
 from energy_metrics import EnergyMetrics, MONTHS_FR
@@ -38,6 +38,7 @@ SOFT = colors.HexColor("#f3f6f7")
 GREEN = colors.HexColor("#e45638")
 GREEN_SOFT = colors.HexColor("#fff3ef")
 BLUE = colors.HexColor("#447bd4")
+EXPORT_YELLOW = colors.HexColor("#e7b91b")
 GRID = colors.HexColor("#dce3eb")
 ORANGE = colors.HexColor("#e45638")
 WARNING = colors.HexColor("#fff7e9")
@@ -215,8 +216,8 @@ def _box(text, styles, *, warning=False):
     return box
 
 
-def _section(number, title, styles):
-    return [_para(f'<font color="#e45638">{number}.</font>  {title}', styles, "section"), Spacer(1, 8)]
+def _section(number, title, styles, gap=8):
+    return [_para(f'<font color="#e45638">{number}.</font>  {title}', styles, "section"), Spacer(1, gap)]
 
 
 def _fit_font(text, size, width, font="Soleol-Bold"):
@@ -243,13 +244,14 @@ class _NumberedCanvas(canvas.Canvas):
             self.line(MARGIN, MARGIN-10, PAGE_W - MARGIN, MARGIN-10)
             self.setFont("Soleol", 9)
             self.setFillColor(MUTED)
-            self.drawString(MARGIN, MARGIN-21, "SOLEOL · Autoconsommation & autonomie · " + self._report_data.nature)
+            self.drawString(MARGIN, MARGIN-21, "SOLEOL · Autoconsommation & autonomie · " + self._soleol_page_nature)
             self.drawRightString(PAGE_W - MARGIN, MARGIN-21, f"{self._pageNumber:02d} / {count:02d}")
             super().showPage()
         super().save()
 
 
 def _header(c, doc, data):
+    c._soleol_page_nature = "Simulation batterie" if data.battery else data.nature
     c.saveState()
     logo = Path(__file__).resolve().parent / "assets" / "logo_soleol.png"
     if logo.is_file():
@@ -309,7 +311,7 @@ class _MonthlyHistogram(Flowable):
         c = self.canv
         series = [("Production solaire", "production_kwh", colors.HexColor("#2e9f57")),
                   ("Soutirage réseau", "import_kwh", BLUE),
-                  ("Export réseau", "export_kwh", colors.HexColor("#e7b91b"))]
+                  ("Export réseau", "export_kwh", EXPORT_YELLOW)]
         for i, (label, _, color) in enumerate(series):
             x = i*WIDTH/3
             c.setFillColor(color)
@@ -371,8 +373,150 @@ def _table(rows, widths, styles, *, total=False):
     return table
 
 
+class _BatteryIndicators(Flowable):
+    def __init__(self, data, styles):
+        super().__init__()
+        self.width, self.height = WIDTH, 100
+        self.data, self.styles = data, styles
+
+    def draw(self):
+        c, d = self.canv, self.data
+        width = (WIDTH - 12) / 2
+        indicators = [
+            ("Autoconsommation", "Part de votre production solaire conservée sur place.",
+             d.base.self_consumption_pct, d.after.self_consumption_pct),
+            ("Autonomie énergétique", "Part de votre consommation couverte par votre énergie solaire.",
+             d.base.self_sufficiency_pct, d.after.self_sufficiency_pct),
+        ]
+        for index, (title, definition, before, after) in enumerate(indicators):
+            x = index * (width + 12)
+            c.setStrokeColor(LINE)
+            c.setLineWidth(.7)
+            c.roundRect(x, 0, width, self.height, 5, stroke=1, fill=0)
+            c.setFillColor(INK)
+            c.setFont("Soleol-Bold", 12)
+            c.drawString(x + 11, 80, title)
+            paragraph = _para(definition, self.styles, "small")
+            _, height = paragraph.wrap(width - 22, 30)
+            paragraph.drawOn(c, x + 11, 73 - height)
+            c.setFillColor(MUTED)
+            c.setFont("Soleol", 9.5)
+            c.drawString(x + 11, 43, "Sans batterie")
+            c.drawRightString(x + width - 11, 43, "Avec batterie")
+            c.setFillColor(INK)
+            c.setFont("Soleol", _fit_font(pct(before), 20, width * .39, "Soleol"))
+            c.drawString(x + 11, 22, pct(before))
+            c.setFillColor(MUTED)
+            c.setFont("Soleol", 12)
+            c.drawCentredString(x + width * .49, 25, "→")
+            c.setFillColor(ORANGE)
+            c.setFont("Soleol-Bold", _fit_font(pct(after), 24, width * .43))
+            c.drawRightString(x + width - 11, 21, pct(after))
+            c.setFillColor(INK)
+            c.setFont("Soleol", 9.5)
+            gain = after - before
+            sign = "+" if gain >= 0 else ""
+            c.drawString(x + 11, 7, f"Gain : {sign}{fmt(gain, 1)} points")
+
+
+class _NetworkComparison(Flowable):
+    """Comparaison sur une même échelle, bleu pour l'import, jaune pour l'export."""
+    def __init__(self, data):
+        super().__init__()
+        self.width, self.height, self.data = WIDTH, 108, data
+
+    def draw(self):
+        c, d = self.canv, self.data
+        maximum = max(d.base.import_kwh, d.base.export_kwh, 1.)
+        left, right = 91, WIDTH - 84
+        plot_width = right - left
+        for index, (title, before, after, color) in enumerate([
+            ("Soutirage réseau", d.base.import_kwh, d.after.import_kwh, BLUE),
+            ("Export réseau", d.base.export_kwh, d.after.export_kwh, EXPORT_YELLOW),
+        ]):
+            top = 96 - 47 * index
+            c.setFillColor(INK)
+            c.setFont("Soleol-Bold", 10.5)
+            c.drawString(0, top, title)
+            reduction = 100 * (before - after) / before if before > 0 else 0.
+            c.setFillColor(MUTED)
+            c.setFont("Soleol", 9.5)
+            c.drawRightString(WIDTH, top, "-" + pct(max(0., reduction)))
+            for row, (label, value) in enumerate([("Sans batterie", before), ("Avec batterie", after)]):
+                y = top - 16 - row * 14
+                c.setFillColor(INK)
+                c.setFont("Soleol", 9.5)
+                c.drawString(0, y, label)
+                c.drawRightString(WIDTH, y, fmt(value) + " kWh")
+                fill = colors.Color(*(component * .38 + .62 for component in (color.red, color.green, color.blue))) if row == 0 else color
+                c.setFillColor(fill)
+                c.rect(left, y - 1, plot_width * value / maximum, 10, stroke=0, fill=1)
+        c.setFillColor(MUTED)
+        c.setFont("Soleol", 9.3)
+        c.drawRightString(WIDTH, 0, f"Énergies de la période · échelle commune : 0 à {fmt(maximum)} kWh")
+
+
+def _battery_page(data, styles):
+    b = data.battery
+    identity = (f"<b>{_safe(data.client_name or 'Installation photovoltaïque')}</b>"
+                f"<br/>Période étudiée : <b>{_safe(data.period_label)}</b>")
+    story = [_para("Impact d'une batterie<br/>sur votre installation", styles, "title_small"), Spacer(1, 8),
+             _para(identity, styles), Spacer(1, 8)]
+    story += _section(7, "Batterie simulée", styles, gap=5)
+    parameters = Table([[
+        _para(f'<font color="#667583" size="9.5">Capacité utile</font><br/><b>{fmt(b.capacity_kwh, 1)} kWh</b>', styles),
+        _para(f'<font color="#667583" size="9.5">Puissance charge / décharge</font><br/><b>{fmt(b.power_kw, 1)} kW</b>', styles),
+        _para(f'<font color="#667583" size="9.5">Rendement aller-retour</font><br/><b>{pct(b.efficiency * 100)}</b>', styles),
+    ]], colWidths=[WIDTH / 3] * 3)
+    parameters.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), SOFT), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 9), ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+        ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story += [parameters, Spacer(1, 8)]
+    story += _section(8, "Vos indicateurs avec une batterie", styles, gap=5)
+    story += [_BatteryIndicators(data, styles), Spacer(1, 8)]
+    story += _section(9, "Moins d'échanges avec le réseau", styles, gap=5)
+    story += [_NetworkComparison(data), Spacer(1, 8)]
+    story += _section(10, "Votre surplus solaire valorisé", styles, gap=5)
+    balance = [("Surplus solaire envoyé dans la batterie", b.charge_kwh),
+               ("<b>Énergie restituée pour vos besoins</b>", b.discharge_kwh),
+               ("Pertes liées au stockage", b.losses_kwh)]
+    if b.final_stock_kwh > 1e-6:
+        balance.append(("Énergie encore stockée en fin de période", b.final_stock_kwh))
+    if b.untransferred_stock_kwh > 1e-6:
+        balance.append(("Stock non valorisé dans la simulation", b.untransferred_stock_kwh))
+    rows = [[_para(label, styles, "cell"),
+             _para(("<b>" if index == 1 else "") + fmt(value) + " kWh" + ("</b>" if index == 1 else ""), styles, "number")]
+            for index, (label, value) in enumerate(balance)]
+    table = Table(rows, colWidths=[WIDTH * .76, WIDTH * .24])
+    table.setStyle(TableStyle([
+        ("LINEBELOW", (0, 0), (-1, -1), .5, LINE), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    story += [table, Spacer(1, 8)]
+    conclusion = (f"La batterie vous permettrait d'utiliser <b>{fmt(b.discharge_kwh)} kWh de solaire supplémentaires</b> "
+                  f"pour vos besoins et de couvrir <b>{pct(data.after.self_sufficiency_pct)} de votre consommation</b> avec votre installation.")
+    if b.discharge_kwh <= 1e-6:
+        conclusion = "Avec les paramètres choisis, la simulation ne montre pas de réduction du soutirage réseau sur cette période."
+    note = (f"Simulation à partir des courbes de charge, au pas de {fmt(data.dt_minutes, 1)} minutes. "
+            "L'autonomie compte l'énergie réellement restituée ; l'autoconsommation inclut les pertes et la variation de stock.")
+    box = Table([[_para(conclusion, styles)]], colWidths=[WIDTH])
+    box.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), SOFT),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10), ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 8), ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    story += [KeepTogether(_section(11, "Ce que cela change pour vous", styles, gap=5) +
+                          [box, Spacer(1, 5), _para(note, styles, "small")])]
+    return story
+
+
 def build_report(data: ReportData) -> bytes:
-    """Bilan général de l'installation, comparaison de batterie facultative."""
+    """Deux pages mesurées, puis une page de simulation si une batterie est fournie."""
+    simulation_data = data
+    data = replace(data, after=data.base, battery=None)
     _fonts()
     styles, buffer = _styles(), BytesIO()
     doc = BaseDocTemplate(buffer, pagesize=A4, title="SOLEOL - Autoconsommation et autonomie",
@@ -380,7 +524,10 @@ def build_report(data: ReportData) -> bytes:
     doc.subject = "Sources : " + " ; ".join(_clean(s) for s in data.source_files)
     frame_top = PAGE_H-MARGIN-70
     frame = Frame(MARGIN,MARGIN,WIDTH,frame_top-MARGIN,leftPadding=0,rightPadding=0,topPadding=0,bottomPadding=0)
-    doc.addPageTemplates(PageTemplate(id="soleol",frames=[frame],onPage=lambda c,d:_header(c,d,data)))
+    doc.addPageTemplates([
+        PageTemplate(id="soleol", frames=[frame], onPage=lambda c,d:_header(c,d,data)),
+        PageTemplate(id="battery", frames=[frame], onPage=lambda c,d:_header(c,d,simulation_data)),
+    ])
     story = [_para("Autoconsommation<br/>et autonomie énergétique.",styles,"title"),Spacer(1,15)]
     identity = f"<b>{_safe(data.client_name or 'Installation photovoltaïque')}</b>"
     if data.site_address:
@@ -404,12 +551,9 @@ def build_report(data: ReportData) -> bytes:
         conclusion = (f"<b>Vous conservez sur place {pct(used)} de votre production solaire.</b><br/>"
                       f"Votre solaire couvre {pct(autonomy)} de vos besoins. Le réseau fournit les {pct(100-autonomy)} restants.")
     story += [_para(conclusion,styles)]
-    if data.battery:
-        b = data.battery
-        story += [Spacer(1,9),_para(f"Comparaison facultative : batterie de {fmt(b.capacity_kwh)} kWh utiles, {fmt(b.power_kw,1)} kW, rendement {fmt(b.efficiency*100)} %. Situation mesurée : {pct(data.base.self_consumption_pct)} d'autoconsommation et {pct(data.base.self_sufficiency_pct)} d'autonomie. Pertes de stockage simulées : {fmt(b.losses_kwh)} kWh.",styles,"small")]
     story += [PageBreak(),_para("Votre bilan énergétique.",styles,"title_small"),Spacer(1,15)]
     story += _section(4,"Les énergies de la période",styles)
-    header = ["Énergie (kWh)","Situation<br/>mesurée"] + (["Avec batterie<br/>simulée"] if data.battery else [])
+    header = ["Énergie (kWh)","Situation<br/>mesurée"]
     rows = [header]
     for label,before,after in [
         ("Production solaire",data.base.production_kwh,data.after.production_kwh),
@@ -417,8 +561,8 @@ def build_report(data: ReportData) -> bytes:
         ("Export réseau",data.base.export_kwh,data.after.export_kwh),
         ("Solaire utilisé sur place",data.base.solar_used_kwh,data.after.solar_used_kwh),
         ("Consommation du bâtiment",data.base.consumption_kwh,data.after.consumption_kwh)]:
-        rows.append([label,fmt(before)]+([fmt(after)] if data.battery else []))
-    widths = [WIDTH*.50,WIDTH*.25,WIDTH*.25] if data.battery else [WIDTH*.64,WIDTH*.36]
+        rows.append([label,fmt(before)])
+    widths = [WIDTH*.64,WIDTH*.36]
     story += [_table(rows,widths,styles),Spacer(1,13)]
     story += _section(5,"Comprendre les deux calculs",styles)
     retained = data.after.solar_retained_kwh
@@ -437,7 +581,10 @@ def build_report(data: ReportData) -> bytes:
     rows.append(["Total",fmt(data.base.production_kwh),fmt(data.base.import_kwh),fmt(data.base.export_kwh)])
     story += [_table(rows,[WIDTH*.28,WIDTH*.24,WIDTH*.24,WIDTH*.24],styles,total=True),Spacer(1,7),
               _para("Les fragments d'un même mois sont regroupés sur la période affichée. Valeurs arrondies au kWh, sans extrapolation des flux réseau.",styles,"small")]
-    doc.build(story,canvasmaker=lambda *a,**kw:_NumberedCanvas(*a,report_data=data,**kw))
+    if simulation_data.battery:
+        story += [NextPageTemplate("battery"), PageBreak()]
+        story += _battery_page(simulation_data, styles)
+    doc.build(story,canvasmaker=lambda *a,**kw:_NumberedCanvas(*a,report_data=simulation_data,**kw))
     return buffer.getvalue()
 
 
