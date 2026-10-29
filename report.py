@@ -220,6 +220,16 @@ def _section(number, title, styles, gap=8):
     return [_para(f'<font color="#e45638">{number}.</font>  {title}', styles, "section"), Spacer(1, gap)]
 
 
+def _identity_story(data, styles, *, details=True):
+    identity = f"<b>{_safe(data.client_name or 'Installation photovoltaïque')}</b>"
+    if details and data.site_address:
+        identity += "<br/>" + _safe(data.site_address)
+    if details and data.reference:
+        identity += "<br/>Référence : " + _safe(data.reference)
+    period = f"Période étudiée : <b>{_safe(data.period_label)}</b>"
+    return [_para(identity, styles), Spacer(1, 6), _para(period, styles)]
+
+
 def _fit_font(text, size, width, font="Soleol-Bold"):
     measured = pdfmetrics.stringWidth(text, font, size)
     return min(size, size * width / measured) if measured else size
@@ -272,16 +282,29 @@ def _header(c, doc, data):
 class _Indicators(Flowable):
     def __init__(self, data, styles):
         super().__init__()
-        self.width, self.height = WIDTH, 100 if data.battery else 87
+        self.width = WIDTH
         self.data, self.styles = data, styles
+        used, autonomy = data.base.self_consumption_pct, data.base.self_sufficiency_pct
+        explanation = (f"{pct(used)} de l'électricité produite par vos panneaux solaires "
+                       "est utilisée directement chez vous.")
+        if data.existing_battery:
+            explanation = (f"{pct(used)} de votre production solaire n'est pas envoyée sur le réseau. "
+                           "Ce taux inclut le fonctionnement de votre batterie.")
+        self.indicators = [
+            ("Autoconsommation", used, explanation),
+            ("Autonomie énergétique", autonomy,
+             f"{pct(autonomy)} de l'électricité que vous consommez provient de vos panneaux solaires. "
+             "Le reste vient du réseau."),
+        ]
+        text_width = (WIDTH - 12) / 2 - 24
+        heights = [_para(text, styles, "calculation").wrap(text_width, 100)[1]
+                   for _, _, text in self.indicators]
+        self.height = max(128, 92 + max(heights))
 
     def draw(self):
-        c, d = self.canv, self.data
+        c = self.canv
         width = (WIDTH - 12)/2
-        for i, (title, definition, current, before) in enumerate([
-            ("Autoconsommation", "Part de votre production solaire utilisée sur place.", d.after.self_consumption_pct, d.base.self_consumption_pct),
-            ("Autonomie énergétique", "Part de votre consommation couverte par votre solaire.", d.after.self_sufficiency_pct, d.base.self_sufficiency_pct),
-        ]):
+        for i, (title, current, explanation) in enumerate(self.indicators):
             x = i*(width+12)
             c.setStrokeColor(LINE)
             c.setLineWidth(.7)
@@ -289,16 +312,12 @@ class _Indicators(Flowable):
             c.setFillColor(INK)
             c.setFont("Soleol-Bold", 12)
             c.drawString(x+12, self.height-22, title)
-            p = _para(definition, self.styles, "small")
-            _, h = p.wrap(width-24, 35)
-            p.drawOn(c, x+12, self.height-30-h)
             c.setFillColor(ORANGE)
             c.setFont("Soleol-Bold", 26)
-            c.drawString(x+12, 12 if not d.battery else 28, pct(current))
-            if d.battery:
-                c.setFont("Soleol", 9.5)
-                c.setFillColor(MUTED)
-                c.drawString(x+12, 11, "Situation mesurée : " + pct(before))
+            c.drawString(x+12, self.height-58, pct(current))
+            p = _para(explanation, self.styles, "calculation")
+            _, h = p.wrap(width-24, 100)
+            p.drawOn(c, x+12, self.height-76-h)
 
 
 class _MonthlyHistogram(Flowable):
@@ -458,10 +477,8 @@ class _NetworkComparison(Flowable):
 
 def _battery_page(data, styles):
     b = data.battery
-    identity = (f"<b>{_safe(data.client_name or 'Installation photovoltaïque')}</b>"
-                f"<br/>Période étudiée : <b>{_safe(data.period_label)}</b>")
-    story = [_para("Impact d'une batterie<br/>sur votre installation", styles, "title_small"), Spacer(1, 8),
-             _para(identity, styles), Spacer(1, 8)]
+    story = [_para("Impact d'une batterie<br/>sur votre installation", styles, "title_small"), Spacer(1, 8)]
+    story += _identity_story(data, styles, details=False) + [Spacer(1, 8)]
     story += _section(7, "Batterie simulée", styles, gap=5)
     parameters = Table([[
         _para(f'<font color="#667583" size="9.5">Capacité utile</font><br/><b>{fmt(b.capacity_kwh, 1)} kWh</b>', styles),
@@ -529,13 +546,7 @@ def build_report(data: ReportData) -> bytes:
         PageTemplate(id="battery", frames=[frame], onPage=lambda c,d:_header(c,d,simulation_data)),
     ])
     story = [_para("Autoconsommation<br/>et autonomie énergétique.",styles,"title"),Spacer(1,15)]
-    identity = f"<b>{_safe(data.client_name or 'Installation photovoltaïque')}</b>"
-    if data.site_address:
-        identity += "<br/>"+_safe(data.site_address)
-    if data.reference:
-        identity += "<br/>Référence : "+_safe(data.reference)
-    identity += "<br/>Période étudiée : <b>"+_safe(data.period_label)+"</b>"
-    story += [_para(identity,styles),Spacer(1,17)]
+    story += _identity_story(data, styles) + [Spacer(1,17)]
     story += _section(1,"Vos deux indicateurs",styles)
     story += [_Indicators(data,styles),Spacer(1,17)]
     if data.existing_battery:
@@ -545,12 +556,19 @@ def build_report(data: ReportData) -> bytes:
     story += _section(3,"Ce que cela signifie pour vous",styles)
     if data.existing_battery:
         conclusion = "Ces taux décrivent le bilan apparent de votre installation. Les seuls échanges du compteur ne permettent pas d'isoler les pertes ni l'origine de charge d'une batterie déjà en service."
+        story += [_para(conclusion, styles)]
     else:
         used = data.after.self_consumption_pct
         autonomy = data.after.self_sufficiency_pct
-        conclusion = (f"<b>Vous conservez sur place {pct(used)} de votre production solaire.</b><br/>"
-                      f"Votre solaire couvre {pct(autonomy)} de vos besoins. Le réseau fournit les {pct(100-autonomy)} restants.")
-    story += [_para(conclusion,styles)]
+        conclusion = (f"<b>Vous consommez directement chez vous {pct(used)} de l'électricité "
+                      "produite par vos panneaux solaires.</b>")
+        coverage = (f"Votre installation solaire fournit {pct(autonomy)} de toute l'électricité que vous consommez. "
+                    f"Les {pct(100-autonomy)} restants sont prélevés sur le réseau électrique.")
+        explanation = ("Lorsque vos panneaux produisent plus d'électricité que ce dont vous avez besoin, "
+                       "le surplus est envoyé sur le réseau. Lorsque leur production est insuffisante, "
+                       "notamment la nuit, le réseau complète vos besoins.")
+        story += [_para(conclusion, styles), Spacer(1, 8),
+                  _para(coverage, styles), Spacer(1, 8), _para(explanation, styles)]
     story += [PageBreak(),_para("Votre bilan énergétique.",styles,"title_small"),Spacer(1,15)]
     story += _section(4,"Les énergies de la période",styles)
     header = ["Énergie (kWh)","Situation<br/>mesurée"]
@@ -561,16 +579,21 @@ def build_report(data: ReportData) -> bytes:
         ("Export réseau",data.base.export_kwh,data.after.export_kwh),
         ("Solaire utilisé sur place",data.base.solar_used_kwh,data.after.solar_used_kwh),
         ("Consommation du bâtiment",data.base.consumption_kwh,data.after.consumption_kwh)]:
-        rows.append([label,fmt(before)])
+        rows.append([label,fmt(before) + " kWh"])
     widths = [WIDTH*.64,WIDTH*.36]
     story += [_table(rows,widths,styles),Spacer(1,13)]
     story += _section(5,"Comprendre les deux calculs",styles)
     retained = data.after.solar_retained_kwh
     useful = data.after.solar_used_kwh
     suffix = " apparente" if data.existing_battery else ""
-    defs = (f"<b>Autoconsommation{suffix}</b><br/>{fmt(retained)} kWh conservés sur place ÷ {fmt(data.after.production_kwh)} kWh produits = <b>{pct(data.after.self_consumption_pct)}</b>.<br/><br/>"
-            f"<b>Autonomie énergétique{suffix}</b><br/>{fmt(useful)} kWh de solaire ÷ {fmt(data.after.consumption_kwh)} kWh consommés = <b>{pct(data.after.self_sufficiency_pct)}</b>.")
-    story += [_para(defs,styles,"calculation"),Spacer(1,14)]
+    self_consumption = (f"{fmt(retained)} kWh consommés sur place ÷ {fmt(data.after.production_kwh)} kWh produits "
+                        f"= <b>{pct(data.after.self_consumption_pct)}</b>.")
+    self_sufficiency = (f"{fmt(useful)} kWh de solaire ÷ {fmt(data.after.consumption_kwh)} kWh consommés "
+                        f"= <b>{pct(data.after.self_sufficiency_pct)}</b>.")
+    story += [_para(f"<b>Autoconsommation{suffix}</b>", styles, "calculation"), Spacer(1, 6),
+              _para(self_consumption, styles, "calculation"), Spacer(1, 13),
+              _para(f"<b>Autonomie énergétique{suffix}</b>", styles, "calculation"), Spacer(1, 6),
+              _para(self_sufficiency, styles, "calculation"), Spacer(1, 14)]
     story += _section(6,"Récapitulatif mensuel",styles)
     monthly = {m.month:m for m in data.months}
     rows = [["Mois","Production<br/>solaire (kWh)","Soutirage<br/>réseau (kWh)","Export<br/>réseau (kWh)"]]
