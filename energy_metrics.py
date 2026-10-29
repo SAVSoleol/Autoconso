@@ -70,6 +70,13 @@ def monthly_coverage(timestamps, valid_mask, dt_hours: float) -> pd.DataFrame:
         raise ValueError("Chronologie ou masque de validité incorrect.")
     local = idx.tz_convert(TIMEZONE)
     periods = local.tz_localize(None).to_period("M")
+    # Fraction de jour civil : une journée d'été/hiver compte comme une journée,
+    # même si sa durée UTC est de 23 ou 25 h.
+    days = local.normalize()
+    day_lengths = np.asarray([(d + pd.DateOffset(days=1)).tz_convert("UTC").value - d.tz_convert("UTC").value
+                              for d in days.unique()], dtype=float) / 3.6e12
+    lengths = dict(zip(days.unique(), day_lengths))
+    day_weights = np.asarray([dt / lengths[d] for d in days])
     rows = []
     for period in periods.unique():
         hours = float(((periods == period) & valid).sum()) * dt
@@ -77,7 +84,8 @@ def monthly_coverage(timestamps, valid_mask, dt_hours: float) -> pd.DataFrame:
         end = start + pd.offsets.MonthBegin(1)
         total = (end.tz_convert("UTC") - start.tz_convert("UTC")).total_seconds() / 3600
         rows.append({"period": str(period), "label": f"{MONTHS_FR[period.month-1]} {period.year}",
-                     "hours": hours, "month_hours": total, "fraction": min(1., hours / total)})
+                     "hours": hours, "month_hours": total, "fraction": min(1., hours / total),
+                     "pv_fraction": min(1., float(day_weights[(periods == period) & valid].sum()) / period.days_in_month)})
     return pd.DataFrame(rows)
 
 
@@ -88,8 +96,11 @@ def _monthly_production(coverage: pd.DataFrame, values: Mapping,
         if row.hours == 0:
             result[row.period] = 0.
             continue
-        # Clés AAAA-MM pour ne jamais confondre deux années.
-        raw = values.get(row.period)
+        # AAAA-MM permet une mesure exacte par année ; 1..12 permet un profil
+        # Janvier..Décembre commun, quelle que soit l'année de la courbe.
+        month = int(row.period[-2:])
+        profile = row.period not in values
+        raw = values.get(row.period) if not profile else values.get(month, values.get(str(month)))
         if raw is None:
             raise ValueError(f"Production manquante : {row.label} (saisir 0 si aucune production).")
         value = float(raw)
@@ -101,7 +112,8 @@ def _monthly_production(coverage: pd.DataFrame, values: Mapping,
                 "Fournir le mois complet ou activer le prorata temporel dans les réglages avancés ; "
                 "ce prorata sera indiqué comme une estimation."
             )
-        result[row.period] = value * row.fraction
+        fraction = row.pv_fraction if profile else row.fraction
+        result[row.period] = value * fraction
     return result
 
 
@@ -176,3 +188,19 @@ def analyse(frame, meta, monthly_kwh: Mapping, *, capacity=15., power=5.,
                         "Autonomie avant (%)": b.self_sufficiency_pct,
                         "Autonomie après (%)": autonomy_after})
     return base, after, sim, pd.DataFrame(records), coverage
+
+
+def calendar_month_results(monthly: pd.DataFrame) -> pd.DataFrame:
+    """Regroupe les fragments de mois homonymes, sans extrapoler les mesures.
+
+    Un mois entièrement absent reste NaN : il n'est jamais transformé en zéro.
+    L'histogramme et le tableau du rapport utilisent exactement cette table.
+    """
+    columns = ["Production PV (kWh)", "Import avant (kWh)", "Export avant (kWh)",
+               "Import après (kWh)", "Export après (kWh)"]
+    source = monthly.copy()
+    source["Numéro du mois"] = source.Mois.str[-2:].astype(int)
+    grouped = source.groupby("Numéro du mois")[columns].sum(min_count=1).reindex(range(1, 13))
+    grouped.insert(0, "Mois", MONTHS_FR)
+    grouped.index.name = "Numéro du mois"
+    return grouped.reset_index()

@@ -11,9 +11,9 @@ import pandas as pd
 import streamlit as st
 
 from demo import make_demo
-from energy_metrics import MONTHS_FR, analyse, monthly_coverage
+from energy_metrics import MONTHS_FR, analyse, monthly_coverage, calendar_month_results
 from loaders import UnsupportedFormatError, load_meter_files, prepare_simulation_data
-from report import BatteryReport, ReportData, build_report, report_filename
+from report import BatteryReport, MonthlyEnergy, ReportData, build_report, report_filename, has_arial
 from ui import dashboard_html, fmt, header_html
 
 ROOT = Path(__file__).resolve().parent
@@ -52,7 +52,7 @@ def demo_data():
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
-def report_pdf(data: ReportData):
+def report_pdf(data: ReportData, arial_installed=False):
     """Cache sur les résultats et les coordonnées : aucun PDF périmé après une modification."""
     return build_report(data)
 
@@ -112,9 +112,9 @@ def main():
             timestamp = st.selectbox("Horodatage", ["Fin d'intervalle", "Début d'intervalle"], key="timestamp",
                                      help="Pour une valeur à 00:15 couvrant 00:00–00:15, choisir fin d'intervalle.")
             interval = st.selectbox("Pas de mesure (minutes)", ["Automatique", 5, 10, 15, 30, 60], key="interval")
-            segments = st.checkbox("Analyser les segments mesurés malgré les trous", value=False, key="segments",
+            segments = st.checkbox("Analyser les segments mesurés malgré les trous", value=True, key="segments",
                                    help="Les valeurs manquantes restent inconnues. La batterie redémarre vide après chaque trou.")
-            prorata = st.checkbox("Estimer la production des mois incomplets au prorata", value=False, key="prorata",
+            prorata = st.checkbox("Estimer la production des mois incomplets au prorata", value=True, key="prorata",
                                   help="À activer uniquement si un bilan estimatif est acceptable. Le temps mesuré ne représente pas nécessairement le même pourcentage de production solaire.")
             blank_unknown = st.checkbox("Groupe E : cellules vides toujours inconnues", key="blank_unknown",
                                         help="Par défaut, la convention zéro d'un flux vide est appliquée uniquement au modèle Groupe E reconnu, si l'autre flux est renseigné.")
@@ -143,16 +143,32 @@ def main():
         st.divider()
         _section(2, "Production photovoltaïque")
         production_kind = st.selectbox("Origine de la production", ["Mesurée aux onduleurs", "Estimée (PVsyst / autre)"], key="production_kind")
+        production_mode = st.selectbox("Saisie de la production", ["12 valeurs communes à toutes les années", "Valeurs distinctes par mois et année"], key="production_mode")
         monthly_pv = {}
         if frame is not None and meta is not None:
             coverage = monthly_coverage(frame.timestamp, frame.simulation_valid, meta.dt_hours)
             active = set(coverage.loc[coverage.hours > 0, "period"])
             identity = "demo-2025" if demo_pv else meta.fingerprint
             if st.session_state.get("pv_source") != identity:
+                for month in range(1, 13):
+                    demo_value = next((v for p, v in (demo_pv or {}).items() if int(p[-2:]) == month), None)
+                    st.session_state[f"pv_month_{month:02d}"] = demo_value
                 for period in active:
                     st.session_state[f"pv_{period}"] = demo_pv.get(period) if demo_pv else None
                 st.session_state.pv_source = identity
-            for year in sorted({int(period[:4]) for period in active}):
+            common_profile = production_mode.startswith("12")
+            active_months = {int(period[-2:]) for period in active}
+            if common_profile:
+                with st.expander("Production mensuelle · Janvier à Décembre", expanded=not all(st.session_state.get(f"pv_month_{m:02d}") is not None for m in active_months)):
+                    st.caption("Une valeur AC par mois, quelle que soit l'année. Sur une période glissante, les morceaux du mois de début et de fin sont pondérés puis regroupés. Le prorata est une estimation de production.")
+                    cols = st.columns(2)
+                    for month, label in enumerate(MONTHS_FR, 1):
+                        with cols[(month - 1) % 2]:
+                            value = st.number_input(label + " (kWh)", min_value=0., max_value=20_000_000., value=None,
+                                                    step=10., placeholder="À saisir", key=f"pv_month_{month:02d}", disabled=month not in active_months)
+                        if month in active_months:
+                            monthly_pv[month] = value
+            for year in ([] if common_profile else sorted({int(period[:4]) for period in active})):
                 with st.expander(f"Production mensuelle · {year}", expanded=not all(st.session_state.get(f"pv_{p}") is not None for p in active)):
                     st.caption("Production totale AC de chaque mois, à la sortie des onduleurs. Saisir 0 pour un mois sans production.")
                     cols = st.columns(2)
@@ -170,7 +186,7 @@ def main():
 
         st.divider()
         _section(3, "Ajouter une batterie")
-        simulate_enabled = st.checkbox("Simuler une batterie", value=True, key="simulate_battery", disabled=existing)
+        simulate_enabled = st.checkbox("Simuler une batterie", value=False, key="simulate_battery", disabled=existing)
         battery_disabled = existing or not simulate_enabled
         capacity = st.slider("Capacité utile (kWh)", min_value=1, max_value=200, value=15, step=1, key="capacity", disabled=battery_disabled,
                              help="Énergie utilisable entre le SOC minimum et maximum. Le modèle ne retranche pas une seconde réserve.")
@@ -204,7 +220,7 @@ def main():
     st.caption(f"{meta.dt_hours * 60:g} min par mesure · {int(valid.sum()):,} intervalles exploités · {meta.completeness:.1%} des intervalles présents et valides · {escape(meta.source)}")
 
     if any(value is None for value in monthly_pv.values()):
-        missing = [f"{MONTHS_FR[int(period[-2:])-1]} {period[:4]}" for period, value in monthly_pv.items() if value is None]
+        missing = [(MONTHS_FR[period-1] if isinstance(period, int) else f"{MONTHS_FR[int(period[-2:])-1]} {period[:4]}") for period, value in monthly_pv.items() if value is None]
         st.info("Production mensuelle à compléter : " + ", ".join(missing) + ".")
         _empty_dashboard()
         return
@@ -231,7 +247,9 @@ def main():
         cycles_placeholder.caption(f"Cycles équivalents sur la période : {fmt(sim.cycles_period,1)}")
 
     with st.expander("Rapport PDF"):
-        st.caption("Rapport de deux pages conforme à la maquette. Les avertissements de lecture sont ajoutés en annexe lorsqu'ils sont présents.")
+        st.caption("Bilan d'autoconsommation et d'autonomie, histogramme annuel et tableau des 12 mois. La période réelle du fichier est conservée.")
+        include_battery = st.checkbox("Inclure aussi la comparaison avec la batterie simulée", value=False,
+                                      disabled=sim is None, key="report_include_battery") and sim is not None
         identity_columns = st.columns(2)
         client_name = identity_columns[0].text_input("Client / nom du projet", key="report_client", max_chars=160,
                                                     placeholder="Nom du client ou de l'installation")
@@ -239,20 +257,21 @@ def main():
                                                          placeholder="Facultatif")
         site_address = st.text_input("Adresse / site", key="report_address", max_chars=240, placeholder="Facultatif")
         report_data = ReportData(
-            base=base, after=after, period_start=meta.start, period_end=meta.end,
+            base=base, after=after if include_battery else base, period_start=meta.start, period_end=meta.end,
             client_name=client_name or ("Exemple de démonstration" if is_demo else ""),
             site_address=site_address, reference=report_reference,
             source_files=(meta.source,) if is_demo else tuple(file.name for file in uploads),
-            battery=BatteryReport.from_simulation(sim) if sim else None,
+            battery=BatteryReport.from_simulation(sim) if include_battery else None,
             valid_intervals=int(valid.sum()), expected_intervals=len(frame),
             dt_minutes=meta.dt_hours * 60, completeness=meta.completeness,
             monthly_entered_kwh=sum(monthly_pv.values()),
             production_estimated=production_kind.startswith("Estimée"),
             prorata=estimated_period, existing_battery=existing, is_demo=is_demo,
             warnings=tuple(meta.warnings),
+            months=tuple(MonthlyEnergy.from_record(row) for row in calendar_month_results(monthly).to_dict("records")),
         )
         try:
-            pdf_content = report_pdf(report_data)
+            pdf_content = report_pdf(report_data, has_arial())
         except (OSError, ValueError) as error:
             st.error(f"Le rapport PDF ne peut pas être généré : {error}")
         else:
@@ -260,6 +279,8 @@ def main():
                                file_name=report_filename(report_data), mime="application/pdf",
                                key="download_report", width="stretch", type="primary")
         st.caption("Le document reprend les résultats et paramètres actuels. Après une modification, le rapport est automatiquement actualisé.")
+        if not has_arial():
+            st.caption("Arial : lancer COPIER_ARIAL.bat sur votre PC Windows puis ajouter les fichiers arial.ttf et arialbd.ttf au dossier assets/fonts sur GitHub. Sans ces fichiers, la police de remplacement est Liberation Sans.")
 
     with st.expander("Détail mensuel et export"):
         if existing:
